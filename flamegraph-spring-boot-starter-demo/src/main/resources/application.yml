@@ -1,0 +1,6 @@
+server:
+  port: 8080
+
+flamegraph:
+  enabled: true
+  sample-interval: 20 # 演示时调高频率，以便快速看到效果

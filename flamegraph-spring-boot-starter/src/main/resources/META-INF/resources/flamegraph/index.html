@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Java Method Flame Graph</title>
+    <script src="https://d3js.org/d3.v5.min.js"></script>
+    <script src="https://unpkg.com/d3-flame-graph@4.1.3/dist/d3-flamegraph.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/d3-flame-graph@4.1.3/dist/d3-flamegraph.css"/>
+    <style>
+        html, body {
+            height: 100%; margin: 0; padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f5f5; overflow: hidden;
+            display: flex; flex-direction: column;
+        }
+
+        .header {
+            background: white; padding: 10px 20px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.1); z-index: 10;
+            display: flex; justify-content: space-between; align-items: center;
+            flex-shrink: 0; height: 50px;
+        }
+
+        .header-left { display: flex; align-items: center; gap: 15px; }
+        .header-title h1 { margin: 0; font-size: 18px; color: #333; }
+
+        .status-badge {
+            font-size: 12px; padding: 3px 10px; border-radius: 12px;
+            background: #eee; color: #666; display: flex; align-items: center; gap: 6px; transition: all 0.3s;
+        }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #ccc; }
+        .running .dot { background: #28a745; box-shadow: 0 0 5px #28a745; animation: pulse 1.5s infinite; }
+        .running { background: #e6f4ea; color: #1e7e34; border: 1px solid #c3e6cb; }
+
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+
+        .controls { display: flex; gap: 8px; align-items: center; }
+
+        button {
+            padding: 6px 12px; border: none; border-radius: 4px;
+            cursor: pointer; font-size: 12px; font-weight: 600; color: white;
+            transition: all 0.2s; display: flex; align-items: center; gap: 5px;
+        }
+        button:hover { opacity: 0.9; transform: translateY(-1px); }
+        button:active { transform: translateY(0); }
+
+        .btn-start { background-color: #28a745; }
+        .btn-stop  { background-color: #ffc107; color: #333; }
+        .btn-primary { background-color: #007bff; }
+        .btn-info { background-color: #17a2b8; }
+        .btn-danger { background-color: #dc3545; }
+
+        .main-content {
+            flex: 1; padding: 10px; overflow: hidden;
+            display: flex; flex-direction: column; position: relative;
+        }
+        .chart-wrapper {
+            background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            flex: 1; overflow: hidden; /* 内部滚动由 D3 容器处理 */
+            position: relative; display: flex; flex-direction: column;
+        }
+        #chart { width: 100%; height: 100%; overflow: auto; }
+
+        .overlay-msg {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            text-align: center; color: #666; display: none; pointer-events: none;
+            background: rgba(255,255,255,0.9); padding: 20px; border-radius: 8px;
+        }
+
+        .footer {
+            padding: 5px 20px; background: #fafafa; color: #888;
+            font-size: 11px; text-align: right; flex-shrink: 0; border-top: 1px solid #e0e0e0;
+        }
+    </style>
+</head>
+<body>
+<div class="header">
+    <div class="header-left">
+        <div class="header-title"><h1>🔥 Java Flame Graph</h1></div>
+        <div id="statusIndicator" class="status-badge">
+            <div class="dot"></div>
+            <span id="statusText">已停止</span>
+        </div>
+    </div>
+    <div class="controls">
+        <button id="startBtn" class="btn-start">▶ 启动采样</button>
+        <button id="stopBtn" class="btn-stop" style="display:none;">⏸ 停止采样</button>
+        <div style="width:1px; height:20px; background:#ddd; margin:0 5px;"></div>
+        <button id="copyBtn" class="btn-info">📋 复制</button>
+        <button id="refreshBtn" class="btn-primary">🔄 刷新</button>
+        <button id="resetBtn" class="btn-danger">🗑️ 清空</button>
+    </div>
+</div>
+
+<div class="main-content">
+    <div class="chart-wrapper">
+        <div id="chart"></div>
+
+        <div id="loading" class="overlay-msg" style="color:#007bff;">
+            <div style="font-size:20px; margin-bottom:10px;">⏳</div>
+            正在拉取数据...
+        </div>
+
+        <div id="noData" class="overlay-msg">
+            <div style="font-size:24px; margin-bottom:10px;">📭</div>
+            <div>暂无采样数据</div>
+            <div style="font-size:12px; margin-top:5px; color:#999;">请点击“启动采样”并确保应用有负载(CPU/锁)</div>
+        </div>
+
+        <div id="errorMsg" class="overlay-msg" style="color:#dc3545; border:1px solid #f5c6cb;"></div>
+    </div>
+</div>
+
+<div class="footer" id="statusBar">Ready</div>
+
+<script>
+    let flameChart = null;
+    let flameGraphFactory = null;
+    let currentRawData = "";
+    let autoRefreshTimer = null;
+
+    document.addEventListener('DOMContentLoaded', function() {
+        setTimeout(() => {
+            if (typeof d3 === 'undefined') return showError('D3.js 加载失败，请检查网络');
+            initLibrary();
+            checkServerStatus(); // 页面加载时同步服务器状态
+        }, 300);
+
+        document.getElementById('startBtn').onclick = () => toggleSampling(true);
+        document.getElementById('stopBtn').onclick = () => toggleSampling(false);
+        document.getElementById('refreshBtn').onclick = () => loadData(true);
+        document.getElementById('resetBtn').onclick = resetData;
+        document.getElementById('copyBtn').onclick = copyToClipboard;
+    });
+
+    // --- 核心库初始化 ---
+    function initLibrary() {
+        if (typeof flamegraph !== 'undefined') flameGraphFactory = flamegraph;
+        else if (d3 && typeof d3.flamegraph !== 'undefined') flameGraphFactory = d3.flamegraph;
+        else if (window.flamegraph && window.flamegraph.flamegraph) flameGraphFactory = window.flamegraph.flamegraph;
+
+        if (!flameGraphFactory) return showError('d3-flame-graph 库未找到');
+
+        try {
+            // 初始化时不设置固定宽度，而在 render 时动态计算
+            flameChart = flameGraphFactory()
+                .cellHeight(18)
+                .transitionDuration(500)
+                .minFrameSize(2)
+                .sort(true)
+                .title("")
+                .inverted(true); // 火焰图根部在下
+
+            // 窗口变化时重绘
+            window.addEventListener('resize', () => {
+                if(currentRawData) renderChart(currentRawData);
+            });
+        } catch (e) { showError('图表初始化异常: ' + e.message); }
+    }
+
+    // --- 状态控制与轮询 ---
+    async function checkServerStatus() {
+        try {
+            const res = await fetch('/api/v1/flamegraph/status');
+            const data = await res.json();
+            updateUiState(data.sampling);
+        } catch(e) { console.error("Status check error", e); }
+    }
+
+    async function toggleSampling(enable) {
+        try {
+            const endpoint = enable ? '/start' : '/stop';
+            const res = await fetch(`/api/v1/flamegraph${endpoint}`, { method: 'POST' });
+            if(res.ok) {
+                updateUiState(enable);
+                if(enable) loadData(false); // 启动时立即加载一次
+            }
+        } catch(e) { alert("操作失败: " + e.message); }
+    }
+
+    function updateUiState(isSampling) {
+        const indicator = document.getElementById('statusIndicator');
+        const statusText = document.getElementById('statusText');
+
+        // 按钮显隐
+        document.getElementById('startBtn').style.display = isSampling ? 'none' : 'flex';
+        document.getElementById('stopBtn').style.display = isSampling ? 'flex' : 'none';
+
+        if(isSampling) {
+            indicator.classList.add('running');
+            statusText.innerText = "正在采样 (每3s刷新)";
+            // 开启自动轮询
+            if(!autoRefreshTimer) {
+                autoRefreshTimer = setInterval(() => loadData(false), 3000);
+            }
+        } else {
+            indicator.classList.remove('running');
+            statusText.innerText = "已停止";
+            // 关闭自动轮询
+            if(autoRefreshTimer) {
+                clearInterval(autoRefreshTimer);
+                autoRefreshTimer = null;
+            }
+        }
+    }
+
+    // --- 数据加载与渲染 ---
+    async function loadData(showLoading = true) {
+        if(showLoading) setLoading(true);
+        try {
+            const response = await fetch('/api/v1/flamegraph');
+            const textData = await response.text();
+            currentRawData = textData;
+
+            if(showLoading) setLoading(false);
+
+            if (!textData || !textData.trim() || textData.trim().startsWith('#')) {
+                if(showLoading) showNoData(true); // 只有手动刷新才显示"无数据"遮罩，避免自动刷新闪烁
+                // 如果是自动刷新且无数据，保持当前界面或清空图表
+                if(!showLoading && document.getElementById('chart').innerHTML === "") showNoData(true);
+                updateStatus("暂无数据采样...");
+                return;
+            }
+
+            showNoData(false);
+            renderChart(textData);
+            updateStatus(`更新于: ${new Date().toLocaleTimeString()} | 样本量: ${textData.split('\n').length}`);
+        } catch (err) {
+            if(showLoading) setLoading(false);
+            console.error("Load failed", err);
+        }
+    }
+
+    function renderChart(data) {
+        const chartDiv = document.getElementById('chart');
+        // 清空容器
+        chartDiv.innerHTML = '';
+
+        const root = parseCollapsedData(data);
+        if (root.children.length === 0) {
+            showNoData(true);
+            return;
+        }
+
+        // 关键修复：每次渲染前获取当前容器的实际宽度
+        const width = document.querySelector('.chart-wrapper').clientWidth;
+        flameChart.width(width);
+
+        d3.select("#chart").datum(root).call(flameChart);
+    }
+
+    function parseCollapsedData(data) {
+        const root = { name: "root", value: 0, children: [] };
+        const pathMap = new Map();
+        pathMap.set("", root);
+
+        data.trim().split('\n').forEach(line => {
+            if(!line.trim()) return;
+            const lastSpace = line.lastIndexOf(' ');
+            if (lastSpace === -1) return;
+
+            const stack = line.substring(0, lastSpace);
+            const count = parseInt(line.substring(lastSpace + 1));
+            if (isNaN(count)) return;
+
+            const methods = stack.split(';');
+            let currentPath = "";
+            let currentNode = root;
+            root.value += count;
+
+            methods.forEach(method => {
+                const newPath = currentPath + (currentPath ? ";" : "") + method;
+                if (!pathMap.has(newPath)) {
+                    const newNode = { name: method, value: 0, children: [] };
+                    pathMap.set(newPath, newNode);
+                    currentNode.children.push(newNode);
+                }
+                const child = pathMap.get(newPath);
+                child.value += count;
+                currentNode = child;
+                currentPath = newPath;
+            });
+        });
+        return root;
+    }
+
+    // --- 辅助功能 ---
+    async function resetData() {
+        if(!confirm("确定清空所有历史数据？")) return;
+        await fetch('/api/v1/flamegraph/reset', { method: 'POST' });
+        document.getElementById('chart').innerHTML = '';
+        showNoData(true);
+        updateStatus("数据已清空");
+    }
+
+    async function copyToClipboard() {
+        if (!currentRawData) return alert("暂无数据可复制");
+        try {
+            await navigator.clipboard.writeText(currentRawData);
+            const btn = document.getElementById('copyBtn');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = "✅ 已复制";
+            setTimeout(() => btn.innerHTML = originalText, 2000);
+        } catch (e) { alert("复制失败，请手动复制"); }
+    }
+
+    function setLoading(b) {
+        document.getElementById('loading').style.display = b ? 'block' : 'none';
+        document.getElementById('errorMsg').style.display = 'none';
+        if(b) document.getElementById('noData').style.display = 'none';
+    }
+    function showNoData(b) {
+        document.getElementById('noData').style.display = b ? 'block' : 'none';
+        if(b) document.getElementById('chart').innerHTML = '';
+    }
+    function showError(msg) {
+        document.getElementById('errorMsg').innerText = "⚠️ " + msg;
+        document.getElementById('errorMsg').style.display = 'block';
+        document.getElementById('loading').style.display = 'none';
+    }
+    function updateStatus(msg) { document.getElementById('statusBar').innerText = msg; }
+</script>
+</body>
+</html>
